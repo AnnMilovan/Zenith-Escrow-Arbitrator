@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract ZenithEscrowArbitrator {
+    enum DealState { Created, Funded, Completed, Disputed, Canceled }
+
+    struct EscrowDeal {
+        address payable buyer;
+        address payable seller;
+        uint256 agreedAmount;
+        uint256 depositedAmount;
+        DealState state;
+        bytes32 agreementHash;
+    }
+
+    address payable public immutable protocolArbiter;
+    string public platformDescriptor;
+    uint256 public arbitrationFeeBps; // 150 = 1.5%
+    uint256 public dealCounter;
+    uint256 public totalEscrowLocked;
+    uint256 public accumulatedArbiterFees;
+
+    mapping(uint256 => EscrowDeal) public deals;
+
+    event DealInitiated(uint256 indexed dealId, address indexed buyer, address indexed seller, uint256 amount);
+    event DealFunded(uint256 indexed dealId, uint256 amount);
+    event PaymentReleased(uint256 indexed dealId, uint256 amountPaid);
+    event DealAborted(uint256 indexed dealId, uint256 refundedAmount);
+    event DisputeSettled(uint256 indexed dealId, uint256 buyerShare, uint256 sellerShare);
+    event ArbitrationFeeAdjusted(uint256 newFeeBps);
+    event DescriptorUpdated(string newDescriptor);
+    event ArbiterFeesHarvested(address indexed arbiter, uint256 amount);
+
+    modifier onlyArbiter() {
+        require(msg.sender == protocolArbiter, "ZenithEscrow: Not arbiter");
+        _;
+    }
+
+    constructor() {
+        protocolArbiter = payable(msg.sender);
+        platformDescriptor = "Zenith Base Escrow Arbitration Core v1";
+        arbitrationFeeBps = 150; // 1.5%
+    }
+
+    // 1. approveAndReleasePayment
+    function approveAndReleasePayment(uint256 dealId) external {
+        EscrowDeal storage d = deals[dealId];
+        require(dealId > 0 && dealId <= dealCounter, "ZenithEscrow: Invalid deal ID");
+        require(d.buyer == msg.sender || msg.sender == protocolArbiter, "ZenithEscrow: Unauthorized");
+        require(d.state == DealState.Funded, "ZenithEscrow: Deal not funded");
+
+        d.state = DealState.Completed;
+        uint256 payout = d.depositedAmount;
+        d.depositedAmount = 0;
+        totalEscrowLocked -= payout;
+
+        (bool sent, ) = d.seller.call{value: payout}("");
+        require(sent, "ZenithEscrow: Payout transfer failed");
+
+        emit PaymentReleased(dealId, payout);
+    }
+
+    // 2. cancelEscrowDeal
+    function cancelEscrowDeal(uint256 dealId) external {
+        EscrowDeal storage d = deals[dealId];
+        require(dealId > 0 && dealId <= dealCounter, "ZenithEscrow: Invalid deal ID");
+        require(d.buyer == msg.sender || msg.sender == protocolArbiter, "ZenithEscrow: Unauthorized");
+        require(d.state == DealState.Created || d.state == DealState.Funded, "ZenithEscrow: Cannot cancel");
+
+        d.state = DealState.Canceled;
+        uint256 refund = d.depositedAmount;
+        d.depositedAmount = 0;
+        totalEscrowLocked -= refund;
+
+        if (refund > 0) {
+            (bool sent, ) = d.buyer.call{value: refund}("");
+            require(sent, "ZenithEscrow: Refund transfer failed");
+        }
+
+        emit DealAborted(dealId, refund);
+    }
+
+    // 3. createEscrowDeal
+    function createEscrowDeal(address payable seller, uint256 agreedAmount, bytes32 agreementHash) external returns (uint256) {
+        require(seller != address(0), "ZenithEscrow: Zero seller address");
+        require(agreedAmount > 0, "ZenithEscrow: Zero amount prohibited");
+
+        dealCounter++;
+        deals[dealCounter] = EscrowDeal({
+            buyer: payable(msg.sender),
+            seller: seller,
+            agreedAmount: agreedAmount,
+            depositedAmount: 0,
+            state: DealState.Created,
+            agreementHash: agreementHash
+        });
+
+        emit DealInitiated(dealCounter, msg.sender, seller, agreedAmount);
+        return dealCounter;
+    }
+
+    // 4. depositEscrowFunds
+    function depositEscrowFunds(uint256 dealId) external payable {
+        EscrowDeal storage d = deals[dealId];
+        require(dealId > 0 && dealId <= dealCounter, "ZenithEscrow: Invalid deal ID");
+        require(d.state == DealState.Created, "ZenithEscrow: Deal not in created state");
+        require(msg.value == d.agreedAmount, "ZenithEscrow: Exact agreed amount required");
+
+        d.depositedAmount = msg.value;
+        d.state = DealState.Funded;
+        totalEscrowLocked += msg.value;
+
+        emit DealFunded(dealId, msg.value);
+    }
+
+    // 5. emergencyReserveSweep
+    function emergencyReserveSweep() external onlyArbiter {
+        uint256 fees = accumulatedArbiterFees;
+        if (fees == 0 && address(this).balance > totalEscrowLocked) {
+            fees = address(this).balance - totalEscrowLocked;
+        }
+        require(fees > 0, "ZenithEscrow: No funds available");
+
+        accumulatedArbiterFees = 0;
+        (bool sent, ) = protocolArbiter.call{value: fees}("");
+        require(sent, "ZenithEscrow: Sweep failed");
+
+        emit ArbiterFeesHarvested(protocolArbiter, fees);
+    }
+
+    // 6. resolveDisputeRuling
+    function resolveDisputeRuling(uint256 dealId, uint256 buyerShare, uint256 sellerShare) external onlyArbiter {
+        EscrowDeal storage d = deals[dealId];
+        require(dealId > 0 && dealId <= dealCounter, "ZenithEscrow: Invalid ID");
+        require(d.state == DealState.Funded || d.state == DealState.Disputed, "ZenithEscrow: Not open for ruling");
+        require(buyerShare + sellerShare == d.depositedAmount, "ZenithEscrow: Shares must match deposited amount");
+
+        d.state = DealState.Completed;
+        totalEscrowLocked -= d.depositedAmount;
+        d.depositedAmount = 0;
+
+        if (buyerShare > 0) {
+            (bool sentBuyer, ) = d.buyer.call{value: buyerShare}("");
+            require(sentBuyer, "ZenithEscrow: Buyer transfer failed");
+        }
+        if (sellerShare > 0) {
+            (bool sentSeller, ) = d.seller.call{value: sellerShare}("");
+            require(sentSeller, "ZenithEscrow: Seller transfer failed");
+        }
+
+        emit DisputeSettled(dealId, buyerShare, sellerShare);
+    }
+
+    // 7. updateArbitrationFee
+    function updateArbitrationFee(uint256 newFeeBps) external onlyArbiter {
+        require(newFeeBps <= 1000, "ZenithEscrow: Max fee 10%");
+        arbitrationFeeBps = newFeeBps;
+        emit ArbitrationFeeAdjusted(newFeeBps);
+    }
+
+    // 8. updatePlatformDescriptor
+    function updatePlatformDescriptor(string calldata newDescriptor) external onlyArbiter {
+        require(bytes(newDescriptor).length > 0, "ZenithEscrow: Empty descriptor");
+        platformDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Чтение информации о сделке
+    function getDealDetails(uint256 dealId) external view returns (
+        address buyer,
+        address seller,
+        uint256 agreedAmount,
+        uint256 depositedAmount,
+        DealState state,
+        bytes32 agreementHash
+    ) {
+        EscrowDeal memory d = deals[dealId];
+        return (d.buyer, d.seller, d.agreedAmount, d.depositedAmount, d.state, d.agreementHash);
+    }
+}
